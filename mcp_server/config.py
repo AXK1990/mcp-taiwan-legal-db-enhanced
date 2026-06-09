@@ -19,47 +19,38 @@
 # This preserves *full* SSL verification (verify=True) on macOS + Windows
 # and the majority of Linux installations. No `verify=False` is needed
 # anywhere in the codebase.
-import truststore
-truststore.inject_into_ssl()
+from mcp_server.ssl_setup import inject_os_trust_store
+inject_os_trust_store()
 
 from pathlib import Path
 
-# 專案根目錄（相對於此檔案自動解析，不硬編碼路徑）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# 允許的域名（資安 allow-list，validate_url_domain 會拒絕其他所有 host）
 ALLOWED_DOMAINS = [
     "judgment.judicial.gov.tw",
-    "data.judicial.gov.tw",
     "law.moj.gov.tw",
 ]
 
-# 快取設定
 CACHE_DB_PATH = PROJECT_ROOT / "data" / "cache" / "legal_mcp.db"
 CACHE_JUDGMENT_TTL = 2592000   # 30 天（判決書少有變動，但 parser 更新後需要刷新快取）
 CACHE_SEARCH_TTL = 86400       # 24 小時
 CACHE_REGULATION_TTL = 604800  # 7 天
-CACHE_PCODE_TTL = 2592000      # 30 天
+CACHE_PCODE_TTL = 2592000      # 30 天（PCode 映射快取）
 
-# 搜尋限速
-SEARCH_RATE_LIMIT = 5          # 每分鐘最多 5 次
-SEARCH_DELAY_MIN = 1.0         # 秒
-SEARCH_DELAY_MAX = 3.0         # 秒
+# 搜尋限速（每次搜尋間隔隨機取 MIN ~ MAX 秒）
+SEARCH_DELAY_MIN = 1.0
+SEARCH_DELAY_MAX = 3.0
 
-# 法規 API
 REGULATION_API_BASE = "https://law.moj.gov.tw"
 REGULATION_SINGLE_URL = REGULATION_API_BASE + "/LawClass/LawSingle.aspx"
 REGULATION_ALL_URL = REGULATION_API_BASE + "/LawClass/LawAll.aspx"
 REGULATION_HISTORY_URL = REGULATION_API_BASE + "/LawClass/LawHistory.aspx"
 
-# 司法院
 JUDICIAL_SEARCH_URL = "https://judgment.judicial.gov.tw/FJUD/Default_AD.aspx"
+JUDICIAL_EASY_SEARCH_URL = "https://judgment.judicial.gov.tw/FJUD/Defaulte_AD.aspx"
 JUDICIAL_PRINT_URL = "https://judgment.judicial.gov.tw/FJUD/printData.aspx"
 JUDICIAL_DATA_URL = "https://judgment.judicial.gov.tw/FJUD/data.aspx"
-# 已廢棄：JDoc API 完全回傳 405，改用 JUDICIAL_DATA_URL (data.aspx)
-JDOC_API_BASE = "http://data.judicial.gov.tw/jdg/api"
 
-# 常用法規 pcode 對照表
 PCODE_MAP = {
     "民法": "B0000001",
     "民事訴訟法": "B0010001",
@@ -111,41 +102,33 @@ PCODE_MAP = {
     "民法親屬編施行法": "B0000005",
     "民法繼承編施行法": "B0000006",
     "涉外民事法律適用法": "B0000007",
-    # 不動產與建築
     "建築法": "D0070109",
     "公寓大廈管理條例": "D0070118",
     "不動產經紀業管理條例": "D0060066",
-    # 交通
     "道路交通管理處罰條例": "K0040012",
-    # 其他常用
     "少年事件處理法": "C0010011",
     "社會秩序維護法": "D0080067",
     "遺產及贈與稅法": "G0340072",
 }
 
-# 法院代碼對照表（2026-02-14 自動抓取自 judicial.gov.tw）
 COURT_CODES = {
-    # 最高法院 / 特殊法院
     "憲法法庭": "JCC",
     "司法院刑事補償法庭": "TPC",
     "最高法院": "TPS",
     "最高行政法院": "TPA",
     "懲戒法院": "TPP",
-    "懲戒法院懲戒法庭": "TPPD",  # TPP Disciplinary
+    "懲戒法院懲戒法庭": "TPPD",
     "懲戒法院職務法庭": "TPJ",
     "智慧財產及商業法院": "IPC",
-    # 高等法院
     "臺灣高等法院": "TPH",
     "臺灣高等法院臺中分院": "TCH",
     "臺灣高等法院臺南分院": "TNH",
     "臺灣高等法院高雄分院": "KSH",
     "臺灣高等法院花蓮分院": "HLH",
     "福建高等法院金門分院": "KMH",
-    # 高等行政法院
     "臺北高等行政法院": "TPB",
     "臺中高等行政法院": "TCB",
     "高雄高等行政法院": "KSB",
-    # 地方法院
     "臺灣臺北地方法院": "TPD",
     "臺灣士林地方法院": "SLD",
     "臺灣新北地方法院": "PCD",
@@ -171,7 +154,6 @@ COURT_CODES = {
     "臺灣高雄少年及家事法院": "KSY",
 }
 
-# 案件類型代碼
 CASE_TYPE_CODES = {
     "民事": "V",
     "刑事": "M",
@@ -179,29 +161,29 @@ CASE_TYPE_CODES = {
     "懲戒": "P",
 }
 
-# COURT_CODES 的反轉（code → name）
 COURT_CODE_TO_NAME = {v: k for k, v in COURT_CODES.items()}
 
-# 法院層級（數字越小權威越高，用於搜尋結果排序）
 COURT_LEVEL = {
-    # Level 1: 最高級
-    "JCC": 1,   # 憲法法庭
-    "TPS": 1,   # 最高法院
-    "TPA": 1,   # 最高行政法院
-    # Level 2: 高等級 + 專業法院
+    "JCC": 1,
+    "TPS": 1,
+    "TPA": 1,
     "TPH": 2, "TCH": 2, "TNH": 2, "KSH": 2, "HLH": 2, "KMH": 2,
     "TPB": 2, "TCB": 2, "KSB": 2,
-    "IPC": 2,   # 智慧財產及商業法院
+    "IPC": 2,
     "TPP": 2, "TPPD": 2, "TPJ": 2, "TPC": 2,
-    # Level 3: 地方級 — 不逐一列出，用 .get(code, 3) fallback
 }
 
-# 案件類型反查（code → name）
 CASE_TYPE_CODE_TO_NAME = {v: k for k, v in CASE_TYPE_CODES.items()}
 
 
 def validate_url_domain(url: str) -> bool:
-    """驗證 URL 是否在允許的域名清單中"""
+    """驗證 URL 是否在允許的域名清單中。
+
+    同時檢查 scheme：只接受 http/https，拒絕 file / ftp / gopher 等會
+    誤導驗證結果的協定（例：ftp://judgment.judicial.gov.tw/ 原本會過）。
+    """
     from urllib.parse import urlparse
     parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
     return parsed.hostname in ALLOWED_DOMAINS

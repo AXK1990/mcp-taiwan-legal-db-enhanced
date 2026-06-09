@@ -1,5 +1,5 @@
 [project]
-name = "mcp-taiwan-legal-db"
+name = "mcp-taiwan-legal-db-enhanced"
 version = "1.0.0"
 description = "MCP server for querying Taiwan (ROC) judicial judgments and the national regulation database"
 readme = "README.md"
@@ -7,6 +7,7 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [
     { name = "LawChat", email = "opensource@lawchat.com.tw" },
+    { name = "AXK1990 (Enhanced version maintainer)" },
 ]
 keywords = ["mcp", "taiwan", "legal", "regulation", "judicial", "judgment"]
 classifiers = [
@@ -34,6 +35,8 @@ dependencies = [
     # in Mozilla's bundle lacks the Subject Key Identifier extension,
     # which OpenSSL 3.6+ rejects. See mcp_server/config.py.
     "truststore>=0.9.0",
+    # Required for ZoneInfo on Python 3.9+ when system tzdata is unavailable
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -43,12 +46,12 @@ dev = [
 ]
 
 [project.scripts]
-mcp-taiwan-legal-db = "mcp_server.server:mcp.run"
+mcp-taiwan-legal-db-enhanced = "mcp_server.server:mcp.run"
 
 [project.urls]
-Homepage = "https://github.com/lawchat-oss/mcp-taiwan-legal-db"
-Issues = "https://github.com/lawchat-oss/mcp-taiwan-legal-db/issues"
-Company = "https://lawchat.com.tw"
+Homepage = "https://github.com/AXK1990/mcp-taiwan-legal-db-enhanced"
+Issues = "https://github.com/AXK1990/mcp-taiwan-legal-db-enhanced/issues"
+"Original Project" = "https://github.com/lawchat-oss/mcp-taiwan-legal-db"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -59,3 +62,10 @@ include = ["mcp_server*"]
 
 [tool.setuptools.package-data]
 mcp_server = ["data/*.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["mcp_server/tests"]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+]

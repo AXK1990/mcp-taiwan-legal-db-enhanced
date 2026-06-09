@@ -7,10 +7,12 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server.cache.db import CacheDB
+from mcp_server.tools._errors import error_response
 from mcp_server.tools.regulations import RegulationClient
 from mcp_server.tools.judicial_search import JudicialSearchClient
 from mcp_server.tools.judicial_doc import JudgmentDocClient
 from mcp_server.tools.waf_bypass import JudicialWAFBypass
+from mcp_server.tools.lawsearch import LawSearchClient
 from mcp_server.tools.constitutional_court import (
     get_interpretation as _cc_get_interpretation,
     search_interpretations as _cc_search_interpretations,
@@ -34,6 +36,7 @@ reg_client: RegulationClient | None = None
 jud_search: JudicialSearchClient | None = None
 jud_doc: JudgmentDocClient | None = None
 waf: JudicialWAFBypass | None = None
+law_search: LawSearchClient | None = None
 
 
 async def _maybe_update_pcode_all():
@@ -53,10 +56,21 @@ async def _maybe_update_pcode_all():
         logger.warning("pcode_all.json 更新失敗: %s", e)
 
 
+def _log_background_task_exception(task: asyncio.Task) -> None:
+    """background task 的 done callback：cancelled 無聲，例外必留 traceback。"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Background task %r failed", task.get_name(), exc_info=exc
+        )
+
+
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     """伺服器生命週期：啟動時初始化，關閉時清理"""
-    global cache, reg_client, jud_search, jud_doc, waf
+    global cache, reg_client, jud_search, jud_doc, waf, law_search
 
     # 啟動
     cache = CacheDB()
@@ -68,17 +82,27 @@ async def lifespan(server: FastMCP):
     reg_client = RegulationClient(cache)
     jud_search = JudicialSearchClient(cache, waf)
     jud_doc = JudgmentDocClient(cache, waf)
+    law_search = LawSearchClient(cache, waf)
 
     logger.info("台灣法律資料庫 MCP Server 已啟動")
 
-    _pcode_task = asyncio.create_task(_maybe_update_pcode_all())
-    _pcode_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    _pcode_task = asyncio.create_task(
+        _maybe_update_pcode_all(), name="pcode_all_update"
+    )
+    _pcode_task.add_done_callback(_log_background_task_exception)
+
+    # WAF cookies 預熱：沒預熱的話，第一個請求會在 search handler 內同步等
+    # Playwright warmup，使用者看到的只會是籠統的「搜尋逾時」。
+    _waf_task = asyncio.create_task(waf.ensure_ready(), name="waf_warmup")
+    _waf_task.add_done_callback(_log_background_task_exception)
+
     yield
 
     # 關閉
     await reg_client.close()
     await jud_search.close()
     await jud_doc.close()
+    await law_search.close()
     await cache.close()
     logger.info("MCP Server 已關閉")
 
@@ -109,6 +133,8 @@ async def search_judgments(
     case_number: str = "",
     main_text: str = "",
     max_results: int = 10,
+    offset: int = 0,
+    search_system: str = "auto",
 ) -> dict:
     """搜尋司法院裁判書系統。
 
@@ -116,8 +142,41 @@ async def search_judgments(
     每筆結果含 court（法院名稱）、case_type（民事/刑事/行政）、court_level（1=最高/2=高等/3=地方）。
 
     【重要】查特定案號時，必須用 case_word + case_number（精確查詢），不要把案號放在 keyword。
-    例如查「114年度上易字第503號」→ case_word="上易", case_number="503", year_from=114。
-    keyword 僅用於主題式全文檢索（如「預售屋 遲延交屋」）。
+    所有案件類型（包含一般案件、簡易案件、小額案件）都使用相同方式查詢，系統會自動同時查詢裁判書系統與簡易案件系統。
+    例如查「114年度上易字第503號」→ case_word="上易", case_number="503"（不傳year_from/year_to）。
+    例如查「114年度羅小字第412號」→ case_word="羅小", case_number="412"（不傳year_from/year_to）。
+    例如查「114年度北簡字第100號」→ case_word="北簡", case_number="100"（不傳year_from/year_to）。
+    注意：案號年度與裁判日期年度可能不同，查精確案號時不傳年度可避免遺漏。
+    keyword 僅用於主題式全文檢索（如「預售屋 遲延交屋」），不可用於查詢特定案號。
+
+    【裁判書系統 vs 簡易案件系統】:
+    本工具可查詢兩個系統：
+    1. 裁判書系統（通常系統）- 完整判決，支援所有參數過濾
+    2. 簡易案件系統 - 地方法院簡易/小額案件，但有以下限制：
+       ❌ 不支援 court 參數過濾（無法指定特定地方法院）
+       ❌ 不支援 case_type 參數過濾（無法指定民事/刑事）
+       ✅ 支援 keyword、main_text、case_word、case_number、year 等參數
+
+    【search_system 參數說明】:
+    - "auto"（預設）- 智能判斷：
+      * 指定非地方法院（高等/最高/智財/懲戒） → 只查裁判書系統
+      * 指定地方法院 → 查詢兩個系統（⚠️ 簡易系統會混入其他地院案件）
+      * 未指定法院 → 查詢兩個系統
+    - "both" - 強制查詢兩個系統（即使指定了 court/case_type）
+    - "regular" - 只查裁判書系統（不含簡易案件）
+    - "easy" - 只查簡易系統（僅地方法院簡易/小額案件）
+
+    【指定地方法院時的注意事項】⚠️:
+    當指定地方法院（如「臺灣臺東地方法院」）且 search_system="auto" 或 "both" 時：
+    - 裁判書系統：正確過濾，只回傳該地院判決 ✅
+    - 簡易系統：無法過濾，會混入全國所有地院的簡易案件 ❌
+
+    **解決方法：在 keyword 中加入法院名稱進行二次過濾**
+    範例：查臺東地院的侵權行為案件
+    → keyword="侵權行為 臺灣臺東地方法院", court="臺灣臺東地方法院"
+    → 簡易系統雖會查到其他地院，但因缺少「臺灣臺東地方法院」關鍵字而被排除
+
+    或者使用 search_system="regular" 只查裁判書系統（不含簡易案件）
 
     【進階實務研究欄位】:
     - main_text: 裁判主文關鍵字 — 最有效的輸贏方篩選方式。
@@ -127,24 +186,56 @@ async def search_judgments(
         * 「被告應給付」→ 被告敗訴（金錢給付類）
         * 「原告之訴駁回」→ 原告敗訴
         * 「上訴駁回」→ 維持原審
+      支援布林運算：+（或）、-（不含）、&（且）、()（組合）
+        * 「被告應給付&損害賠償」→ 主文同時包含兩者
+        * 「原告之訴駁回+上訴駁回」→ 主文包含任一種
     可與 keyword 併用，例：
         找「借名登記成立、被告敗訴」→
         main_text="被告應將 移轉", keyword="借名登記", case_type="民事"
 
+    【分頁機制】:
+    本工具每次最多回傳 max_results 筆（上限 200），但實際總筆數可能遠超過 200 筆。
+    回傳結果中的 total_count 欄位顯示真實總筆數（從司法院網頁解析）。
+
+    **當 total_count > 回傳筆數時，表示還有更多結果：**
+    使用 offset 參數可取得後續結果，例如：
+    - 第 1-200 筆：max_results=200, offset=0
+    - 第 201-400 筆：max_results=200, offset=200
+    - 第 401-600 筆：max_results=200, offset=400
+
+    建議：先用小 max_results 測試，確認 total_count 後再用多次呼叫取得完整結果。
+
+    【系統別件數資訊】:
+    查詢結果中會包含 regular_count（裁判書系統件數）和 easy_count（簡易系統件數）。
+
+    **當件數很多時，建議分系統查詢：**
+    - 使用 search_system="regular" 查詢裁判書系統
+    - 使用 search_system="easy" 查詢簡易系統
+    - 可以更精確控制分頁，避免重複抓取資料
+
+    **司法院 500 筆限制：**
+    每個系統各有 500 筆上限，如某系統超過 500 筆，第 501 筆之後無法取得。
+    解決方案：(1) 按時間拆分（年度、月份、日期）(2) 按法院拆分
+
     Args:
-        keyword: 全文檢索關鍵字（對應 jud_kw）
+        keyword: 全文檢索關鍵字（對應 jud_kw）。支援布林運算：+（或）、-（不含）、&（且）、()（組合），例如「不完全給付&瑕疵擔保」、「民法-刑法」
         court: 法院名稱（如「最高法院」「臺灣高等法院」「臺灣臺北地方法院」）
         case_type: 案件類型（民事/刑事/行政/懲戒）
-        year_from: 起始年度（民國年，如 110）
-        year_to: 截止年度（民國年，如 113）
-        case_word: 字別（如「台上」「上易」「重訴」），查特定案號時必填
+        year_from: 起始年度（民國年，如 110），關鍵字搜尋時使用，查精確案號時不填
+        year_to: 截止年度（民國年，如 113），關鍵字搜尋時使用，查精確案號時不填
+        case_word: 字別（如「台上」「上易」「重訴」「羅小」「北簡」），查特定案號時必填
         case_number: 案號（數字），查特定案號時必填
-        main_text: 裁判主文關鍵字（對應 jud_jmain）— 結構化篩選輸贏方
+        main_text: 裁判主文關鍵字（對應 jud_jmain）— 結構化篩選輸贏方。支援布林運算：+（或）、-（不含）、&（且）、()（組合）
         max_results: 回傳筆數上限（預設 10，上限 200）
+        offset: 跳過前幾筆（分頁用，預設 0）
+        search_system: 查詢系統選擇（"auto"=智能判斷, "both"=兩者, "regular"=僅裁判書, "easy"=僅簡易），預設 "auto"
 
     Returns:
         包含搜尋結果的字典：success, query, total_count, results, cached, timestamp
     """
+    if max_results <= 0:
+        return error_response("max_results 必須大於 0")
+
     # 硬上限防止 OOM（100 頁 × 20 筆 = 2000 筆，但實務上 200 已足夠）
     max_results = min(max_results, 200)
     logger.info("search_judgments: keyword=%r, court=%r, case_type=%r, "
@@ -161,6 +252,8 @@ async def search_judgments(
         case_number=case_number,
         main_text=main_text,
         max_results=max_results,
+        offset=offset,
+        search_system=search_system,
     )
     logger.info("search_judgments 完成: success=%s, count=%s, cached=%s",
                 result.get("success"), result.get("total_count", 0), result.get("cached", False))
@@ -191,7 +284,7 @@ async def get_judgment(
         cited_statutes, cited_cases, full_text, source_url
     """
     if not jid and not url:
-        return {"success": False, "error": "至少需要提供 jid 或 url"}
+        return error_response("至少需要提供 jid 或 url")
 
     logger.info("get_judgment: jid=%r, url=%r", jid, url[:80] if url else "")
     if jid:
@@ -234,23 +327,21 @@ async def query_regulation(
     """
     from mcp_server.tools.regulations import get_law_history
 
-    # 解析 pcode
     if not pcode and law_name:
         pcode = reg_client.resolve_pcode(law_name)
         if not pcode:
-            return {
-                "success": False,
-                "error": f"找不到法規「{law_name}」的代碼（pcode）。"
-                         f"請使用 get_pcode 工具查詢，或直接提供 pcode。",
-            }
+            return error_response(
+                f"找不到法規「{law_name}」的代碼（pcode）。"
+                f"請使用 get_pcode 工具查詢，或直接提供 pcode。",
+                law_name=law_name,
+            )
 
     if not pcode:
-        return {"success": False, "error": "須提供 law_name 或 pcode"}
+        return error_response("須提供 law_name 或 pcode")
 
     logger.info("query_regulation: law_name=%r, pcode=%r, article_no=%r, range=%s~%s, history=%s",
                 law_name, pcode, article_no, from_no, to_no, include_history)
 
-    # 查詢邏輯
     if article_no:
         result = await reg_client.get_article(pcode, article_no)
     elif from_no and to_no:
@@ -258,7 +349,6 @@ async def query_regulation(
     else:
         result = await reg_client.get_all_articles(pcode)
 
-    # 附加修法沿革
     if include_history and result.get("success"):
         history = get_law_history(pcode)
         if history:
@@ -283,7 +373,6 @@ async def get_pcode(law_name: str) -> dict:
     Returns:
         包含 pcode 的字典，或模糊比對建議
     """
-    # 精確比對（完整清單 11,747 部）
     if law_name in _PCODE_ALL:
         pcode = _PCODE_ALL[law_name]
         return {
@@ -293,10 +382,8 @@ async def get_pcode(law_name: str) -> dict:
             "status": "已廢止" if pcode in _ABOLISHED_SET else "現行法規",
         }
 
-    # 模糊比對
     resolved = reg_client.resolve_pcode(law_name)
     if resolved:
-        # 從反查表取得完整名稱
         full_name = _PCODE_REVERSE.get(resolved, law_name)
         return {
             "success": True,
@@ -306,18 +393,16 @@ async def get_pcode(law_name: str) -> dict:
             "status": "已廢止" if resolved in _ABOLISHED_SET else "現行法規",
         }
 
-    # 回傳相似的選項
     suggestions = [
         name for name in _PCODE_ALL
         if law_name in name or name in law_name
     ]
 
-    return {
-        "success": False,
-        "error": f"找不到「{law_name}」對應的 pcode",
-        "suggestions": suggestions[:10],
-        "available_count": len(_PCODE_ALL),
-    }
+    return error_response(
+        f"找不到「{law_name}」對應的 pcode",
+        suggestions=suggestions[:10],
+        available_count=len(_PCODE_ALL),
+    )
 
 
 # ============================================================
@@ -340,7 +425,9 @@ async def search_regulations(keyword: str, offset: int = 0, exclude_abolished: b
         符合關鍵字的法規列表
     """
     if not keyword:
-        return {"success": False, "error": "請提供搜尋關鍵字"}
+        return error_response("請提供搜尋關鍵字")
+    if offset < 0:
+        return error_response("offset 不可為負數")
 
     logger.info("search_regulations: keyword=%r, offset=%d, exclude_abolished=%s",
                 keyword, offset, exclude_abolished)
@@ -355,7 +442,6 @@ async def search_regulations(keyword: str, offset: int = 0, exclude_abolished: b
                 "status": "已廢止" if pcode in _ABOLISHED_SET else "現行法規",
             })
 
-    # 排序：現行法規優先，再依名稱排序
     matches.sort(key=lambda m: (m["status"] != "現行法規", m["law_name"]))
 
     page_size = 50
@@ -455,6 +541,247 @@ def get_citations(
         include_context: 每個引用附上原文前後 80 字片段
     """
     return _cc_get_citations(case_id, include_context)
+
+
+# ============================================================
+# 工具 9：搜尋法令判解
+# ============================================================
+
+@mcp.tool()
+async def search_legal_interpretations(
+    keyword: str,
+    doc_type: str = "",
+    max_results: int = 20,
+    offset: int = 0,
+) -> dict:
+    """搜尋司法院法令判解系統（legal.judicial.gov.tw/FINT）。
+
+    可搜尋大法官解釋、憲法法庭裁判、決議、法律問題、精選裁判、行政函釋等。
+    與 get_interpretation / search_interpretations 的差異：
+    - 本工具查詢線上「法令判解系統」，支援全文關鍵字搜尋，可跨多個資料類型
+    - get_interpretation 查詢的是離線快取的大法官解釋／憲判字
+
+    doc_type 可填以下中文名稱或留空（空白 = 全部類型）：
+    憲法法庭裁判、大法官解釋、大法官不受理決議、司法解釋、
+    大法庭專區、停止適用之判例、精選裁判、決議、法律問題、行政函釋
+
+    分頁說明：每次最多回傳 max_results 筆，使用 offset 跳過前幾筆。
+    例如取第 21-40 筆：max_results=20, offset=20。
+
+    Args:
+        keyword:     關鍵字（法院名稱、裁判案號、案由、全文檢索字詞）。支援布林運算：+（或）、-（不含）、&（且）、()（組合），例如「不完全給付&瑕疵擔保」
+        doc_type:    資料類型篩選，空白表示搜尋全部類型
+        max_results: 最多回傳筆數（預設 20，上限 200）
+        offset:      跳過前幾筆（分頁用，預設 0）
+
+    Returns:
+        {success, keyword, doc_type, categories（各類筆數）,
+         total_count, results, cached, timestamp}
+        results 每筆含：doc_type, title, date, summary, ty, id, url
+    """
+    logger.info(
+        "search_legal_interpretations: keyword=%r, doc_type=%r, offset=%d",
+        keyword, doc_type, offset,
+    )
+    result = await law_search.search(
+        keyword=keyword,
+        doc_type=doc_type,
+        max_results=max_results,
+        offset=offset,
+    )
+    logger.info(
+        "search_legal_interpretations 完成: success=%s, count=%s",
+        result.get("success"), result.get("total_count", 0),
+    )
+    return result
+
+
+# ============================================================
+# 工具 9-2：進階搜尋法令判解（支援日期範圍）
+# ============================================================
+
+@mcp.tool()
+async def search_legal_interpretations_advanced(
+    keyword: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    doc_types: list[str] | None = None,
+    max_results: int = 20,
+    offset: int = 0,
+) -> dict:
+    """進階搜尋司法院法令判解系統，支援日期範圍篩選和文件類型過濾。
+
+    ## 核心機制說明
+
+    本工具採用「兩階段查詢」設計：
+    1. 第一階段：送出查詢條件（日期、關鍵字），取得 categories 統計
+    2. 第二階段：根據 categories 的類型名稱，精確篩選結果
+
+    **重要：categories 中的 "name" 欄位值，可以直接用於 doc_types 參數！**
+
+    ## 推薦工作流程（兩次查詢）
+
+    **第一次查詢（探索）：**
+    ```
+    search_legal_interpretations_advanced(
+        date_from="114/1/1",
+        date_to="114/12/31",
+        doc_types=None  # 不指定類型
+    )
+
+    回傳：
+    categories: [
+        {"ty": "Q", "name": "法律問題", "count": 80},
+        {"ty": "D", "name": "決議", "count": 0},
+        {"ty": "J", "name": "精選裁判", "count": 197},
+        ...
+    ]
+    ```
+
+    **第二次查詢（精確取得）：**
+    ```
+    search_legal_interpretations_advanced(
+        date_from="114/1/1",
+        date_to="114/12/31",
+        doc_types=["法律問題"],  # 直接使用 categories 的 name 值
+        max_results=100  # 調高上限以取得全部 80 筆
+    )
+
+    回傳：
+    全部 80 筆「法律問題」類型的結果
+    ```
+
+    ## 使用範例
+
+    **範例 1：查詢 96 年所有決議**
+    ```python
+    # 步驟 1：先查看有多少筆
+    result1 = search_legal_interpretations_advanced(
+        date_from="96/1/1", date_to="96/12/31"
+    )
+    # categories 顯示：{"ty": "D", "name": "決議", "count": 20}
+
+    # 步驟 2：取得全部 20 筆決議
+    result2 = search_legal_interpretations_advanced(
+        date_from="96/1/1",
+        date_to="96/12/31",
+        doc_types=["決議"],  # 使用 categories 的 name
+        max_results=50
+    )
+    ```
+
+    **範例 2：查詢 114 年高院法律座談會**
+    （注意：法律座談會在「法律問題」類別，不在「決議」類別）
+    ```python
+    # 步驟 1：查看 114 年有哪些類型
+    result1 = search_legal_interpretations_advanced(
+        date_from="114/1/1", date_to="114/12/31"
+    )
+    # categories 顯示：{"ty": "Q", "name": "法律問題", "count": 80}
+
+    # 步驟 2：取得全部 80 筆法律問題
+    result2 = search_legal_interpretations_advanced(
+        date_from="114/1/1",
+        date_to="114/12/31",
+        doc_types=["法律問題"],
+        max_results=100
+    )
+    ```
+
+    **範例 3：查詢特定細分類型**
+    ```python
+    # 只查民事決議（網站表單直接支援的細分類型）
+    result = search_legal_interpretations_advanced(
+        date_from="96/1/1",
+        date_to="96/12/31",
+        doc_types=["民事決議"]
+    )
+    ```
+
+    ## 文件類型選項說明
+
+    **概括類型（對應 categories 的 name，使用後篩選機制）：**
+    - "憲法法庭裁判", "大法官解釋", "大法官不受理決議", "司法解釋"
+    - "大法庭專區", "停止適用之判例", "精選裁判", "決議", "法律問題", "行政函釋"
+
+    **細分類型（網站表單直接支援，使用前篩選機制）：**
+    - "民事決議", "刑事決議", "家事決議", "行政決議"
+
+    **錯誤處理：**
+    如果 doc_types 包含無效值，工具會報錯並列出所有有效選項。
+
+    ## 參數說明
+
+    Args:
+        keyword:     關鍵字（選填），可用於縮小搜尋範圍
+        date_from:   起始日期，格式：民國年/月/日（如 "114/1/1"）
+        date_to:     結束日期，格式：民國年/月/日（如 "114/12/31"）
+        doc_types:   文件類型列表（使用 categories 的 name 值或細分類型），None = 全部類型
+        max_results: 最多回傳筆數（預設 20，上限 200），建議第二次查詢時調高以取得全部結果
+        offset:      跳過前幾筆（分頁用，預設 0）
+
+    Returns:
+        {success, query, categories（各類筆數）, total_count, results, cached, timestamp}
+
+        categories 結構：[{"ty": "代碼", "name": "類型名稱", "count": 筆數}, ...]
+        results 每筆含：doc_type, title, date, summary, ty, id, url
+    """
+    logger.info(
+        "search_legal_interpretations_advanced: keyword=%r, date_from=%r, date_to=%r, doc_types=%r, offset=%d",
+        keyword, date_from, date_to, doc_types, offset,
+    )
+    result = await law_search.search_advanced(
+        keyword=keyword,
+        date_from=date_from,
+        date_to=date_to,
+        doc_types=doc_types,
+        max_results=max_results,
+        offset=offset,
+    )
+    logger.info(
+        "search_legal_interpretations_advanced 完成: success=%s, count=%s",
+        result.get("success"), result.get("total_count", 0),
+    )
+    return result
+
+
+# ============================================================
+# 工具 10：取得法令判解全文
+# ============================================================
+
+@mcp.tool()
+async def get_legal_interpretation(
+    ty: str,
+    doc_id: str,
+) -> dict:
+    """取得司法院法令判解系統單筆全文。
+
+    從 search_legal_interpretations 結果的 ty 和 id 欄位帶入。
+
+    ty 代碼對應：
+      JCC=憲法法庭裁判、CD=大法官解釋、T=大法官不受理決議、C=司法解釋、
+      J2=大法庭專區、J1=停止適用之判例、J=精選裁判、D=決議、Q=法律問題、E=行政函釋
+
+    Args:
+        ty:     資料類型代碼（從 search_legal_interpretations 結果取得）
+        doc_id: 文件 ID（從 search_legal_interpretations 結果取得）
+
+    Returns:
+        {success, ty, id, doc_type, title, full_text, url, cached, timestamp}
+    """
+    if not ty or not doc_id:
+        return {
+            "success": False,
+            "error": "請提供 ty 和 doc_id（從 search_legal_interpretations 結果取得）",
+        }
+
+    logger.info("get_legal_interpretation: ty=%r, doc_id=%r", ty, doc_id)
+    result = await law_search.get_document(ty=ty, doc_id=doc_id)
+    logger.info(
+        "get_legal_interpretation 完成: success=%s, cached=%s",
+        result.get("success"), result.get("cached", False),
+    )
+    return result
 
 
 # ============================================================

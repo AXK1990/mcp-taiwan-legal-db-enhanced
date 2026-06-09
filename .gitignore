@@ -1,36 +1,53 @@
+*.backup
+test_easy.py
+test_easy2.py
+
+# 同步腳本（每台電腦路徑不同）
+sync-*.bat
+
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
 *.egg-info/
-mcp_taiwan_legal_db.egg-info/
-dist/
-build/
 
-# Virtual environment
+# 資料和快取
+data/
+*.db
+.judicial_cookies.json
+
+# 虛擬環境
 .venv/
 venv/
-env/
-
-# Runtime cache (SQLite DB created at startup)
-mcp_server/data/cache/
-/data/cache/
-*.db
-*.db-journal
-*.db-shm
-*.db-wal
-
-# F5 WAF bypass cookies (re-generated on demand)
-mcp_server/data/.judicial_cookies.json
 
 # IDE
 .vscode/
 .idea/
-*.swp
+
+# 系統
 .DS_Store
 Thumbs.db
+nul
 
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
+# 敏感資訊
+.env
+secrets.json
+
+# 內部開發文件（不公開）
+claude.md
+CLAUDE_START.txt
+MCP工具架構說明.md
+DEVELOPMENT_PLAN.md
+DEVELOPMENT.md
+FEATURES_COMPARISON.md
+歷史開發紀錄.txt
+
+# 測試腳本與輸出
+debug_*.py
+get_*.py
+search_test.py
+test_advanced_form.py
+test_query_decision*.py
+search_results*.txt
+pytest.ini
+PR_DRAFT.md
