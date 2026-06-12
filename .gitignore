@@ -35,6 +35,7 @@ secrets.json
 
 # 內部開發文件（不公開）
 claude.md
+CLAUDE.md
 CLAUDE_START.txt
 MCP工具架構說明.md
 DEVELOPMENT_PLAN.md
